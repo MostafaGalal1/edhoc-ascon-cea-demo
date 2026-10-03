@@ -1,0 +1,110 @@
+
+==============================================================================
+ Setup: provisioning at manufacturing
+==============================================================================
+  sensor-07  static P-256 DH key, credential 93 B, kid 0x07
+  gateway-1  static P-256 DH key, credential 93 B, kid 0x0a
+  Each side stores the other's public key. Only the 1-byte kid is ever sent:
+  no certificates, no certificate authority, nothing to parse on the sensor.
+  All traffic flows sensor -> attacker -> gateway over real UDP sockets.
+
+==============================================================================
+ Act 1  Today: SDI-12 readings travel in clear text
+==============================================================================
+  The CO2 probe measures 4,800 ppm, close to the OSHA 5,000 ppm limit.
+  The controller must close the CO2 valve and ventilate.
+  
+  sensor      19 B  20 30 2b 32 34 2e 31 2b 36 38 2e 30 2b 34 38 30 30 0d 0a  plain ASCII: '0+24.1+68.0+4800\r\n'
+  attacker   reads '0+24.1+68.0+4800', rewrites it to '0+24.1+68.0+800'
+  gateway    accepted (unauthenticated) CO2 = 800 ppm -> keep the CO2 valve OPEN (below the 1,000 ppm set point)
+  [PASS] clear text can be rewritten: gateway acted on 800 ppm and keeps injecting CO2 into a room already at 4,800 ppm
+  
+  The attacker can also invent readings from nothing, since nobody is authenticated:
+  gateway    accepted (unauthenticated) CO2 = 450 ppm -> keep the CO2 valve OPEN (below the 1,000 ppm set point)
+  [PASS] clear text can be spoofed: gateway accepted a reading the sensor never sent
+
+==============================================================================
+ Act 2  The proposed scheme: EDHOC, then Ascon-AEAD128
+==============================================================================
+  The attacker stays on the path but only watches. First the EDHOC handshake:
+  message_1   37 B  03 02 58 20 d9 6b c5 f1 66 78 f2 f3 d9 68 3a 04 72 9f 82 74 ca 44 26 ed ...  method, suite, ephemeral key G_X, C_I
+  message_2   45 B  58 2b a1 cf 92 d0 89 81 b8 57 c6 e9 e8 70 36 4b 3d c5 35 87 e7 bc aa 8a ...  G_Y + encrypted(C_R, ID_CRED_R, MAC_2)
+  message_3   19 B  52 b3 3f b2 00 f3 eb ad 4b d5 8c 3c e1 96 da dd df 58 d9  encrypted(ID_CRED_I, MAC_3)
+  gateway    sensor kid 0x07 authenticated; security context ready (ID 0x00)
+  Measured on the wire: 37 + 45 + 19 = 101 bytes  (paper, Table 1: 37 + 45 + 19 = 101)
+  [PASS] EDHOC handshake completes: both sides authenticated
+  [PASS] handshake size matches Table 1: 101 bytes, versus 894 for DTLS 1.3 with raw public keys
+  The identities (ID_CRED_R, ID_CRED_I) and MACs are encrypted: a passive
+  observer learns neither which sensor this is nor which gateway it talks to.
+  
+  The EDHOC exporter derives the security context; readings are now sealed with Ascon-AEAD128.
+  sensor      38 B  10 01 00 01 00 56 b1 3d af be 64 4a d9 0c c7 cc 53 18 cc 54 49 b9 fe 19 ...  06:00 reading, 450 ppm (attacker keeps a copy)
+  gateway    accepted (authenticated) CO2 = 450 ppm -> keep the CO2 valve OPEN (below the 1,000 ppm set point)
+  sensor      39 B  10 01 01 01 00 0a e8 6f 79 86 e0 be 44 02 a7 0b bb d5 d7 78 1a 09 5f 1e ...  14:00 reading, 4,800 ppm
+  attacker   sees only ciphertext: '+4800' appears nowhere in the frame
+  gateway    accepted (authenticated) CO2 = 4800 ppm -> close CO2 valve and ventilate (above the 1,000 ppm set point)
+  [PASS] protected reading delivered: gateway closes the valve and ventilates
+  Protection overhead per reading: 20 bytes (16-byte tag + Partial IV + 1-byte ID + 2 length bytes).
+
+==============================================================================
+ Act 3  Attacks against the proposed scheme
+==============================================================================
+  1. Tamper: flip one ciphertext bit to change the CO2 value
+  gateway    REJECTED: IntegrityError: authentication tag does not match: frame was forged or modified
+  [PASS] tampering detected: the modified reading never reaches the controller
+  2. Replay: resend the genuine 06:00 frame (450 ppm) to make the controller inject CO2
+  gateway    REJECTED: ReplayError: sequence number 0 was already accepted
+  [PASS] replay detected: a genuine but old frame is refused
+  3. Forge: build a protected frame with a guessed key
+  gateway    REJECTED: IntegrityError: authentication tag does not match: frame was forged or modified
+  [PASS] forgery detected: without the session key no valid tag can be made
+  4. Fake sensor ID: a rogue device claims kid 0x07 but has its own key
+  gateway    REJECTED: sensor kid 0x07 failed authentication: EDHOCError::MacVerificationFailed
+  [PASS] impersonation rejected: MAC_3 cannot be computed without sensor-07's key
+  5. Unknown sensor ID: a device that was never provisioned (kid 0x55)
+  gateway    REJECTED: unknown sensor kid 0x55: not provisioned on this gateway
+  [PASS] unknown device rejected: no credential, no session
+  6. Tampered handshake: change one byte of G_X inside message_1 in transit
+  sensor     message_2 did not verify, gateway not authenticated: EDHOCError::ParsingError
+  [PASS] tampered handshake rejected: the transcript no longer matches, so the sensor refuses to derive keys
+  7. Rogue gateway: the attacker answers message_1 itself, posing as gateway-1
+  sensor     message_2 did not verify, gateway not authenticated: EDHOCError::MacVerificationFailed
+  [PASS] rogue gateway rejected: the sensor only accepts the gateway key it was provisioned with
+  
+  Not covered by cryptography: an attacker can still drop packets (denial of service).
+  The gateway can only notice the silence and alarm on a missed reporting interval.
+
+==============================================================================
+ Act 4  Cost on a LoRaWAN link (EU868 DR0: SF12, 125 kHz, 51-byte payloads)
+==============================================================================
+  handshake                                 bytes  frames   airtime
+  EDHOC, static DH keys, kid (measured)       101       3      6.7s
+  EDHOC, signature keys, kid                  216       5     12.7s
+  DTLS 1.3, pre-shared key only               345       8     20.4s
+  DTLS 1.3, pre-shared key, ECDHE             501      12     29.9s
+  TLS 1.3, raw public keys, ECDHE             789      17     45.0s
+  DTLS 1.3, raw public keys, ECDHE            894      18     49.5s
+  
+  EDHOC fits each message in one frame: 3 frames, 6.7 s on air.
+  DTLS 1.3 with raw public keys needs at least 18 frames and 49.5 s, 7.3x more.
+  At the EU868 1% duty cycle, every second on air costs 99 s of enforced silence.
+  Airtime from the Semtech SX1276 formula; frames ignore fragmentation headers,
+  so the DTLS and TLS rows are lower bounds. Non-measured rows are Table 1 of the paper.
+
+==============================================================================
+ Summary
+==============================================================================
+  [PASS] clear text can be rewritten
+  [PASS] clear text can be spoofed
+  [PASS] EDHOC handshake completes
+  [PASS] handshake size matches Table 1
+  [PASS] protected reading delivered
+  [PASS] tampering detected
+  [PASS] replay detected
+  [PASS] forgery detected
+  [PASS] impersonation rejected
+  [PASS] unknown device rejected
+  [PASS] tampered handshake rejected
+  [PASS] rogue gateway rejected
+
+  12/12 checks passed

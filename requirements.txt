@@ -1,0 +1,4 @@
+lakers-python==0.6.2
+cbor2>=5.6
+cryptography>=42
+pytest>=8
