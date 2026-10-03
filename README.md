@@ -30,7 +30,10 @@ python run_demo.py --step          # pauses before each act, for presenting live
 python -m pytest -q                # 18 tests
 ```
 
-`docs/sample-output.txt` is a recorded run, if you only want to read it.
+`docs/sample-output.txt` is a recorded run, if you only want to read it, and
+`docs/demo.mp4` is a 2.5-minute video of a real run with captions.
+To re-render the video: `pip install pillow`, have `ffmpeg` on the PATH, then
+`python tools/make_video.py docs/demo.mp4`.
 On an Intel Mac, `pip` builds lakers from source and needs a Rust toolchain.
 
 ## What runs where

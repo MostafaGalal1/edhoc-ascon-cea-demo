@@ -288,7 +288,7 @@ class Demo:
             outcome = "no answer"
         self.say(f"{s.cyan}sensor{s.reset}     {outcome}")
         self.check("tampered handshake rejected", outcome != "completed",
-                   "the transcript no longer matches, so the sensor refuses to derive keys")
+                   "a changed message_1 never yields a session key")
         attacker.uplink_hook = None
         fresh.close()
         try:
